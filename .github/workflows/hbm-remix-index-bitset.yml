@@ -1,0 +1,506 @@
+# Put this file at .github/workflows/hbm-remix-index-bitset.yml in your GitHub repository.
+# This workflow is a new index test; its full Windows build has not yet run.
+# It builds only the x64 runtime DLL for the existing e876135b Remix installation.
+name: Build HBM Remix index test with VRAM fix
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: remix
+
+    steps:
+      - name: Fetch matching Remix source and submodules
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIAGameWorks/dxvk-remix
+          ref: e876135b37295dc203ccdb7b20a8089629588201
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+          path: remix
+
+      - name: Install build helper
+        run: |
+          python -m pip install meson==1.1.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Apply the checked draw-state ownership fix
+        run: |
+          @'
+          import hashlib
+          from pathlib import Path
+          import subprocess
+
+          expected_revision = "e876135b37295dc203ccdb7b20a8089629588201"
+          actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if actual != expected_revision:
+              raise SystemExit("Unexpected source revision; refusing to patch")
+
+          path = Path("src/dxvk/rtx_render/rtx_types.h")
+          original = path.read_bytes()
+          data = original.replace(b"\r\n", b"\n")
+          expected_before = "c6124ce05b4c4909b1f11a4430b8fb8dc6a19f3066e683f669b44a2131514d7e"
+          expected_after = "59f43fad6149772694a7943ebcb1217bef610e3ac3d26b9557c4d3ed2af80cc6"
+          if hashlib.sha256(data).hexdigest() != expected_before:
+              raise SystemExit("Source header does not match the tested patch")
+
+          old = (
+              b"  DrawCallState() = default;\n"
+              b"  DrawCallState(const DrawCallState& _input) = default;\n"
+              b"  DrawCallState& operator=(const DrawCallState& drawCallState) = default;\n"
+          )
+          new = old + (
+              b"  // Queue transfers must relinquish geometry resources in consumed ring slots.\n"
+              b"  DrawCallState(DrawCallState&&) = default;\n"
+              b"  DrawCallState& operator=(DrawCallState&&) = default;\n"
+          )
+          if data.count(old) != 1:
+              raise SystemExit("Patch location is not unique")
+          patched = data.replace(old, new)
+          if hashlib.sha256(patched).hexdigest() != expected_after:
+              raise SystemExit("Patched header failed verification")
+          path.write_bytes(patched.replace(b"\n", b"\r\n") if b"\r\n" in original else patched)
+          print("Applied the validated VRAM queue fix. No BLAS animation fix is included.")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --stat
+
+      - name: Apply and verify the index patch
+        run: |
+          @'
+          from pathlib import Path
+          import hashlib
+          import subprocess
+
+          revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if revision != "e876135b37295dc203ccdb7b20a8089629588201":
+              raise SystemExit("Unexpected source revision; refusing to patch")
+          path = Path("src/d3d9/d3d9_rtx_geometry.cpp")
+          raw = path.read_bytes()
+          original = raw.replace(b"\r\n", b"\n").decode("utf-8")
+          if hashlib.sha256(original.encode()).hexdigest() != "7c57e05e1de39085d5e8b620a72e06fe163bd64995a691cccbc586a6f734a80e":
+              raise SystemExit("Geometry source differs from the checked revision")
+          helper = r"""/*
+           * Copyright (c) 2026.
+           * Permission is hereby granted, free of charge, to any person obtaining a copy
+           * of this software and associated documentation files (the "Software"), to
+           * deal in the Software without restriction, including without limitation the
+           * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+           * sell copies of the Software, and to permit persons to whom the Software is
+           * furnished to do so, subject to the following conditions:
+           * The above copyright notice and this permission notice shall be included in
+           * all copies or substantial portions of the Software.
+           * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+           * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+           * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+           * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+           * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+           * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+           * IN THE SOFTWARE.
+           */
+          #pragma once
+
+          #include <algorithm>
+          #include <cassert>
+          #include <cstddef>
+          #include <cstdint>
+          #include <type_traits>
+          #include <vector>
+          #if defined(_MSC_VER)
+          #include <intrin.h>
+          #endif
+
+          namespace dxvk {
+          namespace sorted_unique_indices_detail {
+            // Called only for nonzero words. BSF requires no BMI/AVX feature support.
+            inline uint32_t firstSetBit(uint32_t word) {
+              assert(word != 0);
+          #if defined(_MSC_VER)
+              unsigned long bit;
+              _BitScanForward(&bit, word);
+              return static_cast<uint32_t>(bit);
+          #elif defined(__GNUC__) || defined(__clang__)
+              return static_cast<uint32_t>(__builtin_ctz(word));
+          #else
+              uint32_t bit = 0;
+              while ((word & 1u) == 0) {
+                word >>= 1;
+                ++bit;
+              }
+              return bit;
+          #endif
+            }
+          }
+
+            // Preserve the original ascending unique-index sequence. This sequence is
+            // consumed by seeded geometry hashing, so changing its order is not safe.
+            template<typename T>
+            void deduplicateSortIndicesBitset(const void* pIndexData,
+                                             const size_t indexCount,
+                                             const uint32_t maxIndexValue,
+                                             std::vector<T>& uniqueIndicesOut) {
+              static_assert(std::is_same<T, uint16_t>::value ||
+                            std::is_same<T, uint32_t>::value,
+                            "Remix index buffers contain unsigned 16/32-bit indices");
+              uniqueIndicesOut.clear();
+              if (indexCount == 0)
+                return;
+
+              const uint64_t indexRange = uint64_t(maxIndexValue) + 1;
+              // Dense/repeated meshes benefit from the original straight stores. Avoid
+              // making those draws pay for repeated bit read/modify/write operations.
+              if (indexRange <= indexCount && indexRange <= UINT32_MAX && indexCount <= UINT32_MAX) {
+                const uint32_t denseRange = static_cast<uint32_t>(indexRange);
+                uniqueIndicesOut.resize(denseRange, T(0));
+                const T* indices = static_cast<const T*>(pIndexData);
+                for (uint32_t i = 0; i < indexCount; ++i) {
+                  const T& index = indices[i];
+                  assert(index <= maxIndexValue);
+                  uniqueIndicesOut[index] = 1;
+                }
+                uint32_t uniqueCount = 0;
+                for (uint32_t i = 0; i < denseRange; ++i) {
+                  if (uniqueIndicesOut[i])
+                    uniqueIndicesOut[uniqueCount++] = static_cast<T>(i);
+                }
+                uniqueIndicesOut.resize(uniqueCount);
+                return;
+              }
+
+              const size_t wordCount = static_cast<size_t>((indexRange + 31) / 32);
+              std::vector<uint32_t> bins(wordCount, 0);
+              const T* indices = static_cast<const T*>(pIndexData);
+              for (size_t i = 0; i < indexCount; ++i) {
+                const uint32_t index = indices[i];
+                assert(index <= maxIndexValue);
+                bins[index >> 5] |= uint32_t(1) << (index & 31);
+              }
+
+              // The output cannot exceed either the input count or the index range.
+              const size_t outputLimit = static_cast<size_t>(
+                std::min<uint64_t>(indexCount, indexRange));
+              uniqueIndicesOut.resize(outputLimit);
+              size_t uniqueCount = 0;
+              for (size_t wordIndex = 0; wordIndex < wordCount; ++wordIndex) {
+                uint32_t word = bins[wordIndex];
+                const uint32_t baseIndex = static_cast<uint32_t>(wordIndex * 32);
+                if (word == UINT32_MAX) {
+                  // Dense words have consecutive output; compilers can vectorize this.
+                  for (uint32_t bit = 0; bit < 32; ++bit)
+                    uniqueIndicesOut[uniqueCount++] = static_cast<T>(baseIndex + bit);
+                } else {
+                  while (word != 0) {
+                    const uint32_t bit = sorted_unique_indices_detail::firstSetBit(word);
+                    uniqueIndicesOut[uniqueCount++] = static_cast<T>(baseIndex + bit);
+                    word &= word - 1;
+                  }
+                }
+              }
+              uniqueIndicesOut.resize(uniqueCount);
+            }
+          }
+          """
+          if hashlib.sha256(helper.encode()).hexdigest() != "ae6782d28a9adc72f982ff7803e480b0260aa27a44beacad4ef6970d88920edf":
+              raise SystemExit("Index helper failed its integrity check")
+          revised = original.replace('#include "../util/util_fastops.h"',
+              '#include "../util/util_fastops.h"\n#include "../util/util_sorted_unique_indices.h"')
+          a = revised.index('    // TODO (REMIX-657): Implement optimized variant of this function')
+          b = revised.index('\n  }', a)
+          revised = revised[:a] + '    deduplicateSortIndicesBitset<T>(pIndexData, indexCount, maxIndexValue, uniqueIndicesOut);' + revised[b:]
+          if hashlib.sha256(revised.encode()).hexdigest() != "ce82b242a92143fd3abd659a65ab4a2ffce5e888d82629df7bc95ccb98cce14d":
+              raise SystemExit("Patched geometry source failed verification")
+          helper_path = Path("src/util/util_sorted_unique_indices.h")
+          if helper_path.exists():
+              raise SystemExit("New helper already exists; refusing to overwrite it")
+          helper_path.write_bytes(helper.encode())
+          path.write_bytes(revised.encode().replace(b"\n", b"\r\n") if b"\r\n" in raw else revised.encode())
+          tests = Path(".hbm-tests")
+          tests.mkdir()
+          (tests / "vendor").mkdir()
+          (tests / "vendor/xxhash.h").write_bytes(Path("src/util/xxHash/xxhash.h").read_bytes())
+          (tests / "original_deduplicate.h").write_text(r"""#pragma once
+          #include <cassert>
+          #include <cstdint>
+          #include <vector>
+          namespace original {
+            template<typename T>
+            void deduplicateSortIndices(const void* pIndexData, const size_t indexCount, const uint32_t maxIndexValue, std::vector<T>& uniqueIndicesOut) {
+              // TODO (REMIX-657): Implement optimized variant of this function
+              // We know there will be at most, this many unique indices
+              const uint32_t indexRange = maxIndexValue + 1;
+
+              // Initialize all to 0
+              uniqueIndicesOut.resize(indexRange, (T)0);
+
+              // Use memory as a bin table for index data
+              for (uint32_t i = 0; i < indexCount; i++) {
+                const T& index = ((T*) pIndexData)[i];
+                assert(index <= maxIndexValue);
+                uniqueIndicesOut[index] = 1;
+              }
+
+              // Repopulate the bins with contiguous index values
+              uint32_t uniqueIndexCount = 0;
+              for (uint32_t i = 0; i < indexRange; i++) {
+                if (uniqueIndicesOut[i])
+                  uniqueIndicesOut[uniqueIndexCount++] = i;
+              }
+
+              // Remove any unused entries
+              uniqueIndicesOut.resize(uniqueIndexCount);
+            }
+
+          }
+          """, encoding="utf-8")
+          (tests / "test_indices.cpp").write_text(r"""#include "../src/util/util_sorted_unique_indices.h"
+          #include "original_deduplicate.h"
+          #define XXH_INLINE_ALL
+          #include "vendor/xxhash.h"
+          #include <chrono>
+          #include <iostream>
+          #include <numeric>
+          #include <random>
+          #include <stdexcept>
+          #include <string>
+
+          void require(bool ok, const char* message) {
+            if (!ok) throw std::runtime_error(message);
+          }
+
+          template<typename T>
+          void check(const std::vector<T>& data, uint32_t maximum,
+                     std::vector<T>& reusedOutput) {
+            std::vector<T> old, reference = data;
+            original::deduplicateSortIndices<T>(data.data(), data.size(), maximum, old);
+            std::sort(reference.begin(), reference.end());
+            reference.erase(std::unique(reference.begin(), reference.end()), reference.end());
+            dxvk::deduplicateSortIndicesBitset<T>(data.data(), data.size(), maximum, reusedOutput);
+            require(old == reference, "original disagrees with sorted reference");
+            require(reusedOutput == old, "bitset changed the sorted unique index sequence");
+          }
+
+          template<typename T>
+          void fixtures(std::mt19937& random) {
+            std::vector<T> out(5000, static_cast<T>(77));
+            for (uint32_t maximum : {0u, 1u, 30u, 31u, 32u, 33u, 63u, 64u, 65u, 255u,
+                                     1023u, 4095u, 65535u}) {
+              check<T>({}, maximum, out);
+              check<T>({0, static_cast<T>(maximum), 0, static_cast<T>(maximum)}, maximum, out);
+              std::vector<T> dense(maximum + 1);
+              std::iota(dense.begin(), dense.end(), T(0));
+              check(dense, maximum, out);
+              std::reverse(dense.begin(), dense.end());
+              check(dense, maximum, out);
+            }
+            for (unsigned test = 0; test < 1500; ++test) {
+              uint32_t maximum = random() % 65536;
+              if constexpr (sizeof(T) == 4) {
+                if (test % 15 == 0) maximum = 1000000 + random() % 1000000;
+              }
+              std::vector<T> data(random() % 4000);
+              for (auto& index : data) index = static_cast<T>(random() % (maximum + 1));
+              if (data.size() > 2) {
+                data[0] = 0;
+                data[1] = static_cast<T>(maximum);
+                if (test % 3 == 0)
+                  for (size_t i = 2; i < data.size(); ++i) data[i] = data[i % 2];
+              }
+              check(data, maximum, out);
+            }
+          }
+
+          template<typename T>
+          uint64_t hashVertices(const std::vector<T>& indices,
+                                const std::vector<uint8_t>& vertices,
+                                uint32_t stride, uint32_t elementSize, uint32_t offset) {
+            uint64_t hash = 0;
+            for (const T index : indices)
+              hash = XXH3_64bits_withSeed(vertices.data() + uint32_t(index) * stride + offset,
+                                        elementSize, hash);
+            return hash;
+          }
+
+          void hashFixtures(std::mt19937& random) {
+            for (uint32_t stride : {12u, 24u, 32u, 48u}) {
+              std::vector<uint8_t> vertices(65536 * stride);
+              for (auto& byte : vertices) byte = static_cast<uint8_t>(random());
+              for (unsigned test = 0; test < 100; ++test) {
+                std::vector<uint32_t> data(50 + random() % 1000), old, out;
+                for (auto& index : data) index = random() % 65536;
+                original::deduplicateSortIndices<uint32_t>(data.data(), data.size(), 65535, old);
+                dxvk::deduplicateSortIndicesBitset<uint32_t>(data.data(), data.size(), 65535, out);
+                require(hashVertices(old, vertices, stride, 12, 0) ==
+                        hashVertices(out, vertices, stride, 12, 0), "position hash changed");
+                if (stride >= 24)
+                  require(hashVertices(old, vertices, stride, 8, 16) ==
+                          hashVertices(out, vertices, stride, 8, 16), "texcoord hash changed");
+              }
+            }
+          }
+
+          volatile uint64_t sink = 0;
+          template<typename T, typename F>
+          double measure(const std::vector<T>& data, uint32_t maximum, F&& function) {
+            const auto start = std::chrono::steady_clock::now();
+            const auto duration = std::chrono::milliseconds(150);
+            size_t iterations = 0;
+            do {
+              for (unsigned batch = 0; batch < 8; ++batch) {
+                // The actual caller creates a fresh output vector for each draw.
+                std::vector<T> output;
+                function(data.data(), data.size(), maximum, output);
+                sink = sink + output.size() + (output.empty() ? 0 : output.back());
+                ++iterations;
+              }
+            } while (std::chrono::steady_clock::now() - start < duration);
+            const auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::micro>(end - start).count() / iterations;
+          }
+
+          template<typename T>
+          void benchmark(const std::string& name, uint32_t maximum, size_t count,
+                         bool dense, std::mt19937& random) {
+            std::vector<T> data(count);
+            for (size_t i = 0; i < count; ++i)
+              data[i] = static_cast<T>(dense ? i % (maximum + 1) : random() % (maximum + 1));
+            std::vector<T> output;
+            check(data, maximum, output);
+            const auto old = measure(data, maximum, original::deduplicateSortIndices<T>);
+            const auto revised = measure(data, maximum, dxvk::deduplicateSortIndicesBitset<T>);
+            std::cout << name << ',' << sizeof(T) * 8 << ',' << maximum + 1 << ','
+                      << count << ',' << output.size() << ',' << old << ',' << revised
+                      << ',' << old / revised << '\n';
+          }
+
+          int main(int argc, char** argv) {
+            std::mt19937 random(0x48424d);
+            if (argc > 1 && std::string(argv[1]) == "--benchmark") {
+              std::cout << "case,index_bits,range,input_count,unique_count,old_us,new_us,speedup\n";
+              benchmark<uint16_t>("tiny_dense", 31, 96, true, random);
+              benchmark<uint16_t>("dense_4k", 4095, 12288, true, random);
+              benchmark<uint32_t>("dense_64k", 65535, 196608, true, random);
+              benchmark<uint32_t>("sparse_64k", 65535, 1500, false, random);
+              benchmark<uint32_t>("sparse_1m", 1048575, 1500, false, random);
+              benchmark<uint32_t>("sparse_1m_larger_draw", 1048575, 12000, false, random);
+              return 0;
+            }
+            fixtures<uint16_t>(random);
+            fixtures<uint32_t>(random);
+            hashFixtures(random);
+            std::cout << "PASS: 3104 sequence fixtures; 400 position and 300 texcoord hash fixtures.\n";
+          }
+          """, encoding="utf-8")
+          print("Applied sorted-unique index optimization; geometry hash order is preserved.")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test the index helper with x64 MSVC
+        run: |
+          . .\build_common.ps1
+          SetupBuild -BuildArch x64
+          cl /nologo /O2 /EHsc /std:c++17 .hbm-tests\test_indices.cpp /Fe:.hbm-tests\test_indices.exe /Fo:.hbm-tests\test_indices.obj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\.hbm-tests\test_indices.exe | Tee-Object .hbm-tests\validation.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\.hbm-tests\test_indices.exe --benchmark | Tee-Object .hbm-tests\index_benchmark.csv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build x64 release runtime
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+          . .\build_common.ps1
+          # The upstream public workflow uses this Windows runner and build helper.
+          # Skip private game test captures; they are not needed to compile the DLL.
+          PerformBuild -BuildFlavour release -BuildSubDir _Comp64Release -Backend ninja -EnableTracy false -SkipApics $true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify and package the runtime DLL
+        run: |
+          $runtimePath = Join-Path (Get-Location) '_output\d3d9.dll'
+          if (!(Test-Path $runtimePath)) { throw 'Release d3d9.dll was not produced' }
+          $binary = [System.IO.File]::ReadAllBytes($runtimePath)
+          if ($binary.Length -lt 64 -or $binary[0] -ne 0x4d -or $binary[1] -ne 0x5a) {
+            throw 'Output is not a Windows executable image'
+          }
+          $peOffset = [BitConverter]::ToInt32($binary, 0x3c)
+          if ($peOffset -lt 0 -or $peOffset + 26 -gt $binary.Length) { throw 'Invalid PE header offset' }
+          if ([BitConverter]::ToUInt32($binary, $peOffset) -ne 0x00004550 -or
+              [BitConverter]::ToUInt16($binary, $peOffset + 4) -ne 0x8664 -or
+              [BitConverter]::ToUInt16($binary, $peOffset + 24) -ne 0x20b) {
+            throw 'Output is not an x64 PE32+ runtime DLL'
+          }
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Copy-Item $runtimePath artifact\d3d9.dll
+          Copy-Item .hbm-tests\validation.txt artifact\INDEX_VALIDATION.txt
+          Copy-Item .hbm-tests\index_benchmark.csv artifact\INDEX_BENCHMARK.csv
+          git diff | Set-Content artifact\SOURCE_DIFF.txt -Encoding utf8
+          $pdbPath = Join-Path (Get-Location) '_Comp64Release\src\d3d9\d3d9.pdb'
+          if (!(Test-Path $pdbPath)) { throw 'Matching runtime PDB was not produced' }
+          New-Item -ItemType Directory -Force -Path symbols | Out-Null
+          Copy-Item $pdbPath symbols\d3d9.pdb
+          Copy-Item artifact\d3d9.dll symbols\d3d9.dll
+          $runtimeHash = (Get-FileHash artifact\d3d9.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$runtimeHash  d3d9.dll" | Set-Content artifact\d3d9.sha256.txt -Encoding utf8
+          @"
+          Source: NVIDIAGameWorks/dxvk-remix e876135b37295dc203ccdb7b20a8089629588201
+          Fixes: DrawCallState move operations plus adaptive sorted-index bitset.
+          Geometry: dense draws use the original bins; sparse draws use bitsets.
+          Build: x64 release on GitHub windows-2022.
+          Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          In-game validation: pending.
+          "@ | Set-Content artifact\BUILD_INFO.txt -Encoding utf8
+          @'
+          Close the game before changing runtime files.
+          Back up your current .trex/d3d9.dll, then replace that file with this x64 DLL.
+          Keep the matching e876135b Remix runtime dependencies and bridge already installed.
+          DO NOT overwrite the game-root d3d9.dll: that is the separate x86 HITMAN proxy.
+          Keep your existing INI, rtx.conf, user.conf and mod assets.
+          This test retains the VRAM queue fix and adds the sorted-index optimization.
+          No merged-BLAS animation change is included.
+          Test the same casino view and settings after warm-up; compare repeated runs.
+          Check replacement identity, geometry, animation and VRAM during traversal.
+          The build passed compilation and PE architecture checks, not an in-game GPU test.
+          Restore the backed-up runtime DLL if launch or rendering regresses.
+          '@ | Set-Content artifact\INSTALL.txt -Encoding utf8
+
+      - name: Upload release DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbm-remix-e876135-index-bitset-release
+          path: remix/artifact/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload matching DLL and debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbm-remix-e876135-index-bitset-symbols
+          path: remix/symbols/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbm-remix-build-logs
+          path: |
+            remix/_Comp64Release/meson-logs/*
+            remix/_Comp64Release/update-deps.log
+            remix/update-deps.log
+          if-no-files-found: ignore
+          retention-days: 7
