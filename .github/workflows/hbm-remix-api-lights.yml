@@ -1030,6 +1030,8 @@ jobs:
           for name,text in files.items(): (folder/name).write_text(text)
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          . .\build_common.ps1
+          SetupBuild -BuildArch x64
           cl /nologo /O2 /EHsc /std:c++17 .hbm-api-light-tests\test_empty_light_frame.cpp /Fe:.hbm-api-light-tests\test_empty_light_frame.exe /Fo:.hbm-api-light-tests\test_empty_light_frame.obj
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & .\.hbm-api-light-tests\test_empty_light_frame.exe | Tee-Object .hbm-api-light-tests\deadlock_validation.txt
