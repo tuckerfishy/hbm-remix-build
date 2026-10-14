@@ -1,7 +1,7 @@
 # Put this file at .github/workflows/hbm-remix-api-lights.yml in your GitHub repository.
 # API light code/workflow passed local checks; the full Windows build is pending.
 # It builds only the x64 runtime DLL for the existing e876135b Remix installation.
-name: Build HBM Remix API light capture and replacements
+name: Build HBM Remix API lights with deadlock fix v2
 
 "on":
   workflow_dispatch:
@@ -1005,6 +1005,38 @@ jobs:
           & .\.hbm-api-light-tests\test_api_lights.exe | Tee-Object .hbm-api-light-tests\validation.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Apply and test empty-light frame deadlock fix v2
+        run: |
+          @'
+          from pathlib import Path
+          import hashlib,json,subprocess
+          if subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip()!="e876135b37295dc203ccdb7b20a8089629588201":
+              raise SystemExit("Unexpected source revision")
+          p=Path("src/dxvk/rtx_render/rtx_light_manager.cpp")
+          raw=p.read_bytes();source=raw.replace(b"\r\n",b"\n").decode()
+          if hashlib.sha256(source.encode()).hexdigest()!='0afeb9e99a27718302d4d34fb64c77c12c58d582297f355b53bf5af9cb12866b':
+              raise SystemExit("Unexpected API light manager source; refusing the deadlock patch")
+          old='    if (m_currentActiveLightCount == 0)\n      clear();'
+          new='    if (m_currentActiveLightCount == 0) {\n      // clear() uses m_lightDebugUILock to acquire and release m_lightUIMutex.\n      // A temporary API guard must release that same mutex before cleanup;\n      // otherwise an empty/disabled-light frame recursively locks it.\n      if (apiLightLock.owns_lock()) apiLightLock.unlock();\n      clear();\n      // clear() also releases an existing legacy frame lock. Reacquire before\n      // touching API frame bookkeeping, whichever owner held it on entry.\n      apiLightLock = lockApiLights();\n    }'
+          if source.count(old)!=1: raise SystemExit("Cleanup location is not unique")
+          source=source.replace(old,new)
+          source=source.replace("; stable API IDs; active-frame capture.","; stable API IDs; active-frame capture; empty-frame deadlock fix v2.")
+          if hashlib.sha256(source.encode()).hexdigest()!='cb239f7dc80f1a6228e4b91aeb81fd09637bd7757de7efb8ae09b6fab252fc9d':
+              raise SystemExit("Deadlock patch output hash mismatch")
+          p.write_bytes(source.encode().replace(b"\n",b"\r\n") if b"\r\n" in raw else source.encode())
+          print("Applied the checked empty-light frame deadlock fix v2")
+          files=json.loads(r"""{"empty_light_clear_under_test.h": "// Extracted verbatim from the patched production source.\n  void LightManager::clear() {\n    if (!m_lightDebugUILock.owns_lock()) {\n      m_lightDebugUILock.lock();\n    }\n    m_lights.clear();\n    m_linearizedLights.clear();\n    for (auto& pair : m_externalLights) pair.second.setBufferIdx(kNewLightIdx);\n    m_apiLightFrames.clear();\n    m_apiReplacementLights.clear();\n    m_lightDebugUILock.unlock();\n  }\n", "empty_light_cleanup_under_test.h": "// Extracted verbatim from the patched production source.\n    if (m_currentActiveLightCount == 0) {\n      // clear() uses m_lightDebugUILock to acquire and release m_lightUIMutex.\n      // A temporary API guard must release that same mutex before cleanup;\n      // otherwise an empty/disabled-light frame recursively locks it.\n      if (apiLightLock.owns_lock()) apiLightLock.unlock();\n      clear();\n      // clear() also releases an existing legacy frame lock. Reacquire before\n      // touching API frame bookkeeping, whichever owner held it on entry.\n      apiLightLock = lockApiLights();\n    }\n", "api_lock_under_test.h": "// Extracted verbatim from the patched production source.\n  std::unique_lock<std::mutex> lockApiLights() const {\n    std::unique_lock<std::mutex> lock(m_lightUIMutex, std::defer_lock);\n    if (!m_lightDebugUILock.owns_lock()) lock.lock();\n    return lock;\n  }\n", "test_empty_light_frame.cpp": "#include <cassert>\n#include <iostream>\n#include <mutex>\n#include <string>\n#include <thread>\n#include <unordered_map>\n#include <vector>\n#include \"../src/util/util_api_light_frames.h\"\nnamespace dxvk {\nconstexpr unsigned kNewLightIdx=0xffff;\nstruct Light {unsigned index=3;void setBufferIdx(unsigned value){index=value;}};\nstruct LightManager {\n  mutable std::mutex m_lightUIMutex;\n  std::unique_lock<std::mutex> m_lightDebugUILock{m_lightUIMutex,std::defer_lock};\n  std::unordered_map<unsigned,Light> m_lights,m_externalLights;\n  std::unordered_map<unsigned,std::vector<Light>> m_apiReplacementLights;\n  std::vector<unsigned> m_linearizedLights;\n  ApiLightFrames<unsigned> m_apiLightFrames;\n  unsigned m_currentActiveLightCount=0;\n#include \"api_lock_under_test.h\"\n  void clear();\n  void prepare(bool legacy=false) {\n    if(legacy)m_lightDebugUILock.lock();\n    auto apiLightLock=lockApiLights();\n#include \"empty_light_cleanup_under_test.h\"\n    // All post-clear API bookkeeping must still be protected. A separate\n    // thread must not acquire this mutex while finishFrame is pending.\n    bool available=false;\n    std::thread probe([&]{available=m_lightUIMutex.try_lock();if(available)m_lightUIMutex.unlock();});\n    probe.join();assert(!available);\n    m_apiLightFrames.finishFrame();\n  }\n  void oldPrepare() {\n    auto apiLightLock=lockApiLights();\n    if(m_currentActiveLightCount==0)clear();\n  }\n};\n#include \"empty_light_clear_under_test.h\"\n}\nint main(int argc,char** argv) {\n  using namespace dxvk;\n  if(argc==2&&std::string(argv[1])==\"--old-deadlock\") {\n    LightManager manager;manager.oldPrepare();return 1;\n  }\n  for(unsigned cycle=0;cycle<200;++cycle)for(bool legacy:{false,true}) {\n    LightManager manager;manager.m_lights.emplace(1,Light{});manager.m_externalLights.emplace(1,Light{});\n    manager.m_apiReplacementLights[1].push_back(Light{});manager.m_linearizedLights.push_back(1);\n    manager.m_apiLightFrames.submit(1,true);\n    manager.m_currentActiveLightCount=cycle%2;\n    manager.prepare(legacy);\n    if(manager.m_currentActiveLightCount==0) {\n      assert(manager.m_lights.empty()&&manager.m_linearizedLights.empty()&&manager.m_apiReplacementLights.empty());\n      assert(manager.m_apiLightFrames.empty()&&manager.m_externalLights.at(1).index==kNewLightIdx);\n      assert(!manager.m_lightDebugUILock.owns_lock());\n    }else {\n      assert(manager.m_lights.size()==1&&manager.m_apiLightFrames.captured().size()==1);\n      assert(manager.m_externalLights.at(1).index==3);\n      if(legacy)manager.m_lightDebugUILock.unlock();\n    }\n    assert(manager.m_lightUIMutex.try_lock());manager.m_lightUIMutex.unlock();\n  }\n  std::cout<<\"PASS: actual clear/cleanup/lock code; 400 empty/active frame cases, temporary and legacy owners, post-clear exclusion, retirement and balanced locks\\n\";\n}\n"}""")
+          folder=Path(".hbm-api-light-tests");folder.mkdir(exist_ok=True)
+          for name,text in files.items(): (folder/name).write_text(text)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /O2 /EHsc /std:c++17 .hbm-api-light-tests\test_empty_light_frame.cpp /Fe:.hbm-api-light-tests\test_empty_light_frame.exe /Fo:.hbm-api-light-tests\test_empty_light_frame.obj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\.hbm-api-light-tests\test_empty_light_frame.exe | Tee-Object .hbm-api-light-tests\deadlock_validation.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build x64 release runtime
         run: |
           Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
@@ -1036,6 +1068,7 @@ jobs:
           Copy-Item .hbm-bounds-tests\validation.txt artifact\BOUNDS_VALIDATION.txt
           Copy-Item .hbm-bounds-tests\bounds_benchmark.csv artifact\BOUNDS_BENCHMARK.csv
           Copy-Item .hbm-api-light-tests\validation.txt artifact\API_LIGHT_VALIDATION.txt
+          Copy-Item .hbm-api-light-tests\deadlock_validation.txt artifact\DEADLOCK_VALIDATION.txt
           git diff | Set-Content artifact\SOURCE_DIFF.txt -Encoding utf8
           $pdbPath = Join-Path (Get-Location) '_Comp64Release\src\d3d9\d3d9.pdb'
           if (!(Test-Path $pdbPath)) { throw 'Matching runtime PDB was not produced' }
@@ -1085,7 +1118,7 @@ jobs:
       - name: Upload release DLL
         uses: actions/upload-artifact@v4
         with:
-          name: hbm-remix-e876135-api-lights-release
+          name: hbm-remix-e876135-api-lights-deadlock-fix-release
           path: remix/artifact/*
           if-no-files-found: error
           retention-days: 7
@@ -1093,7 +1126,7 @@ jobs:
       - name: Upload matching DLL and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: hbm-remix-e876135-api-lights-symbols
+          name: hbm-remix-e876135-api-lights-deadlock-fix-symbols
           path: remix/symbols/*
           if-no-files-found: error
           retention-days: 7
